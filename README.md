@@ -160,6 +160,18 @@ post-`connect_reply` ready sequences are not determined by the marker byte
 alone. Use explicit `--client-ready-sequence` and `--peer-confirm-sequence`
 only while comparing against a fresh official-client research capture.
 
+Extract native ZIME/CAG library evidence from the installed Linux client:
+
+```bash
+node bin/cmcc-cloud-alive.js extract-zime-native
+```
+
+The report summarizes `libcag.so`, `libZIMEDataEngine.so`, and `sdk_config.json`
+signals such as CAG bootstrap functions, ZIME data-channel symbols,
+QUIC/SCTP/DTLS strings, ACK/PING/packet scheduling strings, and keepalive
+timers. This is static transport evidence for implementation work; it does not
+run the SDK or send packets.
+
 Use this as the final proof gate after the VM is already powered/running:
 
 ```bash

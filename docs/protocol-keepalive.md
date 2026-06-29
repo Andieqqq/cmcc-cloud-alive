@@ -480,6 +480,43 @@ For simple `0x81`/`0x89` packets, `word4` often equals the payload length; for T
 
 Native library search found `libZIMEDataEngine.so` with LSQUIC, SCTP, data-channel, packet-out, and UDP byte accounting symbols, plus `SCGDir/sdk_config.json` containing `retransmit`, `ack_loop_period`, and `udp_session_timeout` settings. That is strong evidence that the observed CAG `8899` UDP stream is mediated by the ZIME data engine rather than a trivial custom UDP wrapper. The next implementation step should therefore target ZIME framing/transport behavior or capture local plaintext before ZIME encapsulation, not invent a sender from only the 24-byte tunnel header.
 
+The static native evidence can be regenerated with:
+
+```bash
+node bin/cmcc-cloud-alive.js extract-zime-native
+```
+
+Current static boundary:
+
+```text
+libcag.so:
+  connect_to_access_gateway_opentelemetry
+  send_access_gateway_local_key_opentelemetry
+  recv_access_gateway_key
+  send_access_gateway_connect_info
+
+libZIMEDataEngine.so:
+  ZIMEDataEngine / ZIMEDataEngineCore / ZIMEDataEngineImpl
+  ZIMEDtlsSession
+  ZIMEQuic / ZIMEQuicDataChannel
+  ZIMESctp / ZIMESctpDataChannel
+  lsquic packet_out / ACK / PING / stream scheduling strings
+  usrsctp send/recv/session symbols
+
+sdk_config.json:
+  udp_session_timeout=60
+  ack_loop_period=5000
+  heartbeat_period=6
+  keepalive_timeout=30
+  stream_options: udp ordering=true retransmit=true
+```
+
+This supports the current split: CAG bootstrap is implemented by `libcag.so`,
+while post-`connect_reply` transport semantics belong to the ZIME engine. It
+also explains why replaying a few observed 24-byte tunnel headers is unsafe:
+ACK, retransmit, packet scheduling, stream lifecycle, and heartbeat are managed
+by a stateful reliable-UDP engine.
+
 Loopback plaintext capture from a short official SDK run shows the local GSpice-to-proxy streams clearly:
 
 ```text
