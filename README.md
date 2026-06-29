@@ -203,6 +203,19 @@ Analyze local loopback SPICE traffic:
 node bin/cmcc-cloud-alive.js analyze-loopback /path/to/loopback.pcap
 ```
 
+Correlate an official-client research CAG capture with a synchronized local
+loopback SPICE capture:
+
+```bash
+node bin/cmcc-cloud-alive.js correlate-cag-loopback \
+  /path/to/cag.pcap /path/to/loopback.pcap --window-ms 80 --limit 12
+```
+
+This is an offline research tool. It identifies the external CAG/ZIME packet
+families surrounding proven local SPICE events such as `DISPLAY_INIT`,
+`SURFACE_CREATE`, `DRAW_COPY`, and `MARK`; it does not start the official SDK
+client or send live protocol packets.
+
 Capture a short official SDK run for protocol research only:
 
 ```bash

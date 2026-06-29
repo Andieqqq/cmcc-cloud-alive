@@ -518,6 +518,24 @@ Confirmed stream examples from `/tmp/yidongyun-loopback-spice.pcap`:
   early display messages: SET_ACK, SET_ACK, 0x6c, SURFACE_CREATE, MARK
 ```
 
+Synchronized external CAG and loopback captures can be correlated offline:
+
+```bash
+node bin/cmcc-cloud-alive.js correlate-cag-loopback \
+  /tmp/yidongyun-sync-cag-20260630-023415.pcap \
+  /tmp/yidongyun-sync-loopback-20260630-023415.pcap \
+  --window-ms 80 --limit 8
+```
+
+This links proven local SPICE success events to surrounding external CAG/ZIME
+packet families without sending any live packets. On the synchronized capture,
+the display client `DISPLAY_INIT` frame and server `SURFACE_CREATE`/`MARK`
+frames align with dense CAG/ZIME `data`, `control`, `ack`, and
+`client_control` traffic in the same sub-second window. This is useful for
+transport reverse engineering, but it is still not a standalone keepalive
+implementation: the remaining work is to decode and reproduce the ZIME
+reliable UDP behavior instead of replaying or guessing those packets.
+
 This means the Linux route cannot hard-code the blog's 162-byte RSA key assumption or mini-header-only parsing. The protocol layer now supports dynamic DER-length `SpiceLinkReply` parsing and SPICE full data headers.
 
 The loopback analyzer now emits a direct success-evidence line for the observed display channel:
@@ -871,7 +889,7 @@ The protocol mode is not complete until the final verification item passes.
    - If `scgIp:10800` is available, use the existing SCG AES-CTR and Chuanyun/SPICE modules.
    - Share the same SPICE success predicate with Linux CAG.
 10. Define release criteria.
-   - `yidongyun keepalive --mode protocol` must not spawn official binaries.
+   - `cmcc-cloud-alive keepalive` must not spawn official binaries.
    - Logs must show route, display auth, `DISPLAY_INIT`, surface messages, ACK/PONG counts, and hold duration.
    - A packet capture must show no SDK local socket usage in protocol mode.
    - Cloud VM must remain online past the idle shutdown window.

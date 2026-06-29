@@ -292,6 +292,13 @@ assert.strictEqual(encodeZteCagDataDatagram({
   payload: Buffer.from('160301020000010001fc03039f152d897da44b', 'hex'),
 }).toString('hex'), 'e1db878d8100015000000000000000000000000502000000160301020000010001fc03039f152d897da44b');
 
+const invalidTlsMinorTunnel = parseZteCagDatagram(Buffer.from(
+  'e1db878d81000150000000000000000000000005020000001603f90200',
+  'hex',
+));
+assert.strictEqual(invalidTlsMinorTunnel.hasTlsRecord, false);
+assert.strictEqual(invalidTlsMinorTunnel.tunnel.hasTlsRecord, false);
+
 const dynamicMagicTunnel = parseZteCagDatagram(Buffer.from(
   '34db078781000160000000000000000000000005020000001603010200',
   'hex',
