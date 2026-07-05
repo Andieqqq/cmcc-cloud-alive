@@ -14,3 +14,10 @@ reports/
 *.pcapng
 __pycache__/
 *.pyc
+
+# credential state (tokens/passwords) — never commit
+state.json
+*.state.json
+.cmcc-cloud-alive/
+.venv/
+.goal_progress/

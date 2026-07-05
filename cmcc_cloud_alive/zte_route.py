@@ -29,6 +29,7 @@ from .zte_security import (
 from .zte_raw_spice import (
     BuildZTERawDisplayInit,
     BuildZTERawInputInit,
+    RawMainHandshake,
     RawState,
     RawSubChannelHandshake,
     ReadRawMessage,
@@ -124,6 +125,7 @@ class MaterialReport:
     desktop_count: int = 0
     target_desktop_found: bool = False
     has_connect_str: bool = False
+    connect_str: str = ""  # private; never serialized in to_dict (P6/P7 raw value)
     # never include raw connectStr / key / password / token values
     redacted: Dict[str, Any] = field(default_factory=dict)
 
@@ -464,6 +466,7 @@ def run_material(firm: ZTEFirmAuth, *, target_vm_id: str = TARGET_VM_ID,
                     retries=async_retries, interval=async_interval)
 
             report.has_connect_str = bool(connect_str)
+            report.connect_str = connect_str
             if not connect_str:
                 report.error = "connectStr empty after start + async query"
                 report.next_step = "retry start or inspect desktop state"
@@ -481,6 +484,110 @@ def run_material(firm: ZTEFirmAuth, *, target_vm_id: str = TARGET_VM_ID,
         report.error = "%s: %s" % (type(err).__name__, err)
         report.next_step = "inspect stage %s" % report.stage
         return report
+
+
+def run_zte_keepalive_session(firm: ZTEFirmAuth, connect_str: str, *,
+                              duration: float = 120.0,
+                              auth_template_hex: str = "",
+                              dial_timeout: float = 30.0) -> dict:
+    """Full ZTE CAG → mux → raw-SPICE keepalive session (P6–P9).
+
+    Mirrors B's ``keepaliveZTESession`` (cmd/keepalive.go:115-227) steps 9-19:
+    decode connect params → dial outer CAG (TCP/TLS) → CAGMux → open main link
+    → raw SPICE main handshake → setup subchannels → subchannel keepalive
+    threads → main keepalive loop (blocks for *duration* seconds).
+
+    Parameters
+    ----------
+    firm : ZTEFirmAuth
+        Firm auth record (provides ``cag_ip`` / ``cag_port`` for the outer
+        CAG address).
+    connect_str : str
+        Raw ``connectStr`` obtained from :func:`run_material` (stored on
+        ``MaterialReport.connect_str``).
+    duration : float
+        How long the main keepalive loop should run (seconds).
+    auth_template_hex : str
+        Hex-encoded CAG auth template.  If empty, falls back to the
+        ``CCK_ZTE_CAG_AUTH_TEMPLATE_HEX`` environment variable.
+    dial_timeout : float
+        Timeout for the outer CAG TCP/TLS dial.
+
+    Returns
+    -------
+    dict
+        Counters from :func:`keepaliveRawSpiceLoop`.
+    """
+    import threading
+
+    # Lazy imports to avoid circular dependencies (P10 pattern).
+    from .zte_connect_params import decode_connect_params, inner_from_connect_params
+    from .zte_cag import CAGDialOptions, dial_cag_tcp_tls
+    from .zte_cag_mux import CAGMux, open_cag_mux_link
+
+    if not connect_str:
+        raise ZTEError("connect_str empty — run_material must succeed first")
+
+    # --- P6: decode connect params + build outer/inner separation ---
+    cp = decode_connect_params(connect_str)
+    inner = inner_from_connect_params(cp)
+    outer = outer_from_firm(firm)
+
+    if not auth_template_hex:
+        auth_template_hex = os.environ.get("CCK_ZTE_CAG_AUTH_TEMPLATE_HEX", "")
+    if not auth_template_hex:
+        raise ZTEError("CCK_ZTE_CAG_AUTH_TEMPLATE_HEX env var not set — "
+                       "cannot dial CAG without auth template")
+
+    opts = CAGDialOptions(
+        address=outer.address,
+        inner=inner,
+        auth_template_hex=auth_template_hex,
+        timeout=dial_timeout,
+    )
+
+    # --- P7: dial outer CAG (TCP + TLS) ---
+    tls_conn, _session = dial_cag_tcp_tls(opts)
+
+    # --- P8: CAG multiplexer + main link ---
+    mux = CAGMux.open(tls_conn)
+    main_link = open_cag_mux_link(mux, cp)
+
+    # --- P8: raw SPICE main handshake ---
+    raw_result = RawMainHandshake(
+        main_link, cp.key, cp.vm_id,
+        main_link.link_uuid, main_link.trace_id, main_link.redq_span_id,
+    )
+    if not raw_result.OK:
+        raise ZTEError("raw SPICE main handshake failed: %s"
+                       % (raw_result.error or "unknown"))
+
+    # --- P9: setup subchannels + background keepalive ---
+    sub_links, _authed = setup_zte_subchannels(
+        mux, cp, main_link, raw_result.SpiceSessionID,
+    )
+    stop_event = threading.Event()
+    sub_threads = []
+    for link_id, link in sub_links.items():
+        t = threading.Thread(
+            target=keep_zte_subchannel_alive,
+            args=(link, link_id),
+            kwargs={"stop_event": stop_event},
+            daemon=True,
+            name="zte-sub-keepalive-%d" % link_id,
+        )
+        t.start()
+        sub_threads.append(t)
+
+    # --- P9: main keepalive loop (blocks for *duration* seconds) ---
+    try:
+        counters = keepaliveRawSpiceLoop(main_link, interval=25.0, stop_after=duration)
+    finally:
+        stop_event.set()
+        for t in sub_threads:
+            t.join(timeout=3.0)
+
+    return counters
 
 
 def _async_query_connect_str(client: ZTEClient, access_token: str, *,

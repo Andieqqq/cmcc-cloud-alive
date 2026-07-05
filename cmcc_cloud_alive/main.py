@@ -906,6 +906,29 @@ def _run_zte_keepalive(args, auth, route, vm_id, report, started):
     report["error"] = md.get("error") or ""
     report["nextStep"] = md.get("nextStep") or ""
     report["duration"] = round(time.monotonic() - started, 3)
+
+    # --- P6–P9: full CAG → mux → raw-SPICE keepalive session ---
+    if material.ok and material.connect_str:
+        import os
+        duration = float(getattr(args, "duration", 0) or 0)
+        if duration <= 0:
+            duration = float(os.environ.get("CCK_ZTE_KEEPALIVE_DURATION", "120"))
+        try:
+            counters = zte_route.run_zte_keepalive_session(
+                firm, material.connect_str, duration=duration,
+            )
+            report["stage"] = "zte-keepalive-done"
+            report["keepalive"] = counters
+            report["nextStep"] = "session completed; inspect counters"
+        except Exception as exc:  # noqa: BLE001 - surface CAG/mux/raw failure
+            report["stage"] = "zte-keepalive-failed"
+            report["error"] = "%s: %s" % (type(exc).__name__, exc)
+            report["nextStep"] = ("inspect CAG/mux/raw stage; ensure "
+                                  "CCK_ZTE_CAG_AUTH_TEMPLATE_HEX is set")
+    elif material.ok and not material.connect_str:
+        report["nextStep"] = "material ok but connect_str missing; cannot dial CAG"
+
+    report["duration"] = round(time.monotonic() - started, 3)
     _print(report)
 
 
@@ -963,6 +986,260 @@ def cmd_product_keepalive(args):
     # Defensive: unknown route kind.
     report["error"] = "unhandled route kind: %s" % route.kind
     report["nextStep"] = "extend product_router with the new route kind"
+    report["duration"] = round(time.monotonic() - started, 3)
+    _print(report)
+
+
+# ---------------------------------------------------------------------------
+# P11-005/006/007: ZTE layered diagnostic sub-checks
+# ---------------------------------------------------------------------------
+
+def _zte_subcheck_preamble(args, route_name, stage):
+    """Shared auth/route preamble for the ZTE diagnostic sub-checks.
+
+    Loads firmAuth, classifies the route, validates it is ZTE, and builds a
+    ``ZTEFirmAuth``.  Returns ``(report, started, firm, vm_id, zte_route)`` or
+    ``None`` if a failure report has already been printed.
+    """
+    import time
+    started = time.monotonic()
+    report = _product_keepalive_report(route_name=route_name, stage=stage)
+
+    selected = cloud.selected_user_service_id(args.state, args.user_service_id)
+    report["userServiceId"] = str(selected or "")
+    ns_args = core.argparse.Namespace(state=args.state, user_service_id=selected)
+    try:
+        auth = core.get_firm_auth(ns_args)
+    except Exception as exc:  # noqa: BLE001 - gate must report, not crash
+        report["error"] = str(exc)
+        report["kind"] = product_router.RouteKind.ERROR.value
+        report["reason"] = "firmAuth failed: %s" % exc
+        report["nextStep"] = "fix login/account/firmAuth; do not touch protocol"
+        report["duration"] = round(time.monotonic() - started, 3)
+        _print(report)
+        return None
+
+    route = product_router.classify_firm_auth_route(auth)
+    route.userServiceId = str(selected or "")
+    if not route.vmId:
+        route.vmId = str(auth.get("vmId") or auth.get("vmID") or auth.get("uuid") or "")
+    report["kind"] = route.kind.value
+    report["reason"] = route.reason
+    report["vmId"] = route.vmId
+    report["firmAuthSummary"] = product_router.redacted_firm_auth_summary(auth)
+
+    vm_id = args.vm_id or route.vmId
+
+    if route.kind == product_router.RouteKind.ERROR:
+        report["error"] = route.reason
+        report["nextStep"] = "stop; fix firmAuth fields before any protocol work"
+        report["duration"] = round(time.monotonic() - started, 3)
+        _print(report)
+        return None
+
+    if route.kind != product_router.RouteKind.ZTE:
+        report["error"] = ("route is %s, not ZTE — ZTE sub-checks require a "
+                           "ZTE route" % route.kind.value)
+        report["nextStep"] = ("use product-keepalive, or fix firmAuth to "
+                              "obtain a ZTE route")
+        report["duration"] = round(time.monotonic() - started, 3)
+        _print(report)
+        return None
+
+    try:
+        from . import zte_route
+    except Exception as exc:  # noqa: BLE001 - ZTE route may be mid-flight
+        report["error"] = "zte_route unavailable: %s" % exc
+        report["nextStep"] = "wait for ZTE route (P10) completion before retrying"
+        report["duration"] = round(time.monotonic() - started, 3)
+        _print(report)
+        return None
+
+    try:
+        firm = zte_route.ZTEFirmAuth.from_auth_dict(auth)
+    except Exception as exc:  # noqa: BLE001 - surface ZTE auth build failure
+        report["error"] = "%s: %s" % (type(exc).__name__, exc)
+        report["nextStep"] = "fix firmAuth ZTE fields (cagIp/cagPort/vmId)"
+        report["duration"] = round(time.monotonic() - started, 3)
+        _print(report)
+        return None
+
+    return report, started, firm, vm_id, zte_route
+
+
+def _zte_run_material(args, route_name, stage):
+    """Run ``run_material`` and populate the report from its ``to_dict()``.
+
+    Returns ``(report, started, material, firm, zte_route)`` or ``None`` if a
+    failure report has already been printed.
+    """
+    import time
+    pre = _zte_subcheck_preamble(args, route_name, stage)
+    if pre is None:
+        return None
+    report, started, firm, vm_id, zte_route = pre
+    try:
+        material = zte_route.run_material(firm, target_vm_id=vm_id)
+    except Exception as exc:  # noqa: BLE001 - surface any ZTE failure
+        report["error"] = "%s: %s" % (type(exc).__name__, exc)
+        report["nextStep"] = "inspect ZTE material stage %s" % stage
+        report["duration"] = round(time.monotonic() - started, 3)
+        _print(report)
+        return None
+    md = material.to_dict()
+    report["ok"] = md.get("ok", False)
+    report["stage"] = md.get("stage") or stage
+    report["error"] = md.get("error") or ""
+    report["nextStep"] = md.get("nextStep") or ""
+    return report, started, material, firm, zte_route
+
+
+def cmd_product_zte_material_check(args):
+    """P11-005: verify the ZTE material control-plane up to connectStr.
+
+    Runs ``run_material`` (CAG HTTPS → token → desktop list → connectStr) and
+    stops *before* connectStr parsing.  Emits the standard redacted report.
+    """
+    import time
+    result = _zte_run_material(args, "product-zte-material-check",
+                               "zte-material-check")
+    if result is None:
+        return
+    report, started, material, firm, zte_route = result
+    report["duration"] = round(time.monotonic() - started, 3)
+    _print(report)
+
+
+def cmd_product_zte_tcp_check(args):
+    """P11-006: verify connectStr decode + outer/inner separation (pre-dial).
+
+    Runs ``run_material`` then ``decode_connect_params`` /
+    ``inner_from_connect_params`` / ``outer_from_firm`` and stops *before* the
+    CAG TCP/TLS dial.  Emits the standard redacted report.
+    """
+    import time
+    result = _zte_run_material(args, "product-zte-tcp-check", "zte-tcp-check")
+    if result is None:
+        return
+    report, started, material, firm, zte_route = result
+    if not material.ok or not material.connect_str:
+        report["ok"] = False
+        report["stage"] = "zte-tcp-check"
+        if not report["error"]:
+            report["error"] = ("material ok=%s but connect_str missing — "
+                               "cannot decode" % material.ok)
+        if not report["nextStep"]:
+            report["nextStep"] = "fix material stage to obtain connectStr"
+        report["duration"] = round(time.monotonic() - started, 3)
+        _print(report)
+        return
+    try:
+        from .zte_connect_params import (decode_connect_params,
+                                         inner_from_connect_params)
+        cp = decode_connect_params(material.connect_str)
+        inner_from_connect_params(cp)
+        outer = zte_route.outer_from_firm(firm)
+        _ = outer.address  # touch to validate outer separation
+    except Exception as exc:  # noqa: BLE001 - surface decode failure
+        report["ok"] = False
+        report["stage"] = "zte-tcp-check"
+        report["error"] = "%s: %s" % (type(exc).__name__, exc)
+        report["nextStep"] = ("inspect connectStr decode / outer-inner "
+                              "separation")
+        report["duration"] = round(time.monotonic() - started, 3)
+        _print(report)
+        return
+    report["ok"] = True
+    report["stage"] = "zte-tcp-check"
+    report["error"] = ""
+    report["nextStep"] = ("connectStr decoded; outer/inner separated; "
+                          "ready to dial CAG TCP/TLS")
+    report["duration"] = round(time.monotonic() - started, 3)
+    _print(report)
+
+
+def cmd_product_zte_display_check(args):
+    """P11-007: verify CAG dial + mux + raw SPICE main handshake (pre-DisplayInit).
+
+    Runs ``run_material`` → decode → CAG TCP/TLS dial → mux open → main link →
+    raw SPICE main handshake, and stops *before* the DisplayInit subchannel
+    setup.  Emits the standard redacted report.
+    """
+    import os
+    import time
+    result = _zte_run_material(args, "product-zte-display-check",
+                               "zte-display-check")
+    if result is None:
+        return
+    report, started, material, firm, zte_route = result
+    if not material.ok or not material.connect_str:
+        report["ok"] = False
+        report["stage"] = "zte-display-check"
+        if not report["error"]:
+            report["error"] = ("material ok=%s but connect_str missing — "
+                               "cannot dial" % material.ok)
+        if not report["nextStep"]:
+            report["nextStep"] = "fix material stage to obtain connectStr"
+        report["duration"] = round(time.monotonic() - started, 3)
+        _print(report)
+        return
+    dial_timeout = float(getattr(args, "dial_timeout", 0) or 0) or 30.0
+    tls_conn = None
+    try:
+        from .zte_connect_params import (decode_connect_params,
+                                         inner_from_connect_params)
+        from .zte_cag import CAGDialOptions, dial_cag_tcp_tls
+        from .zte_cag_mux import CAGMux, open_cag_mux_link
+
+        cp = decode_connect_params(material.connect_str)
+        inner = inner_from_connect_params(cp)
+        outer = zte_route.outer_from_firm(firm)
+
+        auth_template_hex = os.environ.get("CCK_ZTE_CAG_AUTH_TEMPLATE_HEX", "")
+        if not auth_template_hex:
+            raise zte_route.ZTEError(
+                "CCK_ZTE_CAG_AUTH_TEMPLATE_HEX env var not set — "
+                "cannot dial CAG without auth template")
+
+        opts = CAGDialOptions(
+            address=outer.address,
+            inner=inner,
+            auth_template_hex=auth_template_hex,
+            timeout=dial_timeout,
+        )
+        tls_conn, _session = dial_cag_tcp_tls(opts)
+        mux = CAGMux.open(tls_conn)
+        main_link = open_cag_mux_link(mux, cp)
+        raw_result = zte_route.RawMainHandshake(
+            main_link, cp.key, cp.vm_id,
+            main_link.link_uuid, main_link.trace_id, main_link.redq_span_id,
+        )
+        if not raw_result.OK:
+            raise zte_route.ZTEError(
+                "raw SPICE main handshake failed: %s"
+                % (getattr(raw_result, "error", None) or "unknown"))
+    except Exception as exc:  # noqa: BLE001 - surface dial/mux/handshake failure
+        report["ok"] = False
+        report["stage"] = "zte-display-check"
+        report["error"] = "%s: %s" % (type(exc).__name__, exc)
+        report["nextStep"] = ("inspect CAG dial / mux / raw SPICE main "
+                              "handshake stage")
+        report["duration"] = round(time.monotonic() - started, 3)
+        _print(report)
+        return
+    finally:
+        if tls_conn is not None:
+            try:
+                close = getattr(tls_conn, "close", None)
+                if callable(close):
+                    close()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
+    report["ok"] = True
+    report["stage"] = "zte-display-check"
+    report["error"] = ""
+    report["nextStep"] = ("CAG dialed + mux opened + raw SPICE main handshake "
+                          "OK; ready for DisplayInit subchannels")
     report["duration"] = round(time.monotonic() - started, 3)
     _print(report)
 
@@ -1373,6 +1650,25 @@ def build_parser():
     p.add_argument("--binary", default=None, help="override the SCG keepalive binary path")
     p.add_argument("--config-dir", default=None, help="override the SCG config directory")
     p.set_defaults(func=cmd_product_keepalive)
+
+    p = sub.add_parser("product-zte-material-check")
+    p.add_argument("--state", default=None, help="override the state directory")
+    p.add_argument("--user-service-id", default=None, help="override the selected user service id")
+    p.add_argument("--vm-id", default=None, help="override the target desktop vmId")
+    p.set_defaults(func=cmd_product_zte_material_check)
+
+    p = sub.add_parser("product-zte-tcp-check")
+    p.add_argument("--state", default=None, help="override the state directory")
+    p.add_argument("--user-service-id", default=None, help="override the selected user service id")
+    p.add_argument("--vm-id", default=None, help="override the target desktop vmId")
+    p.set_defaults(func=cmd_product_zte_tcp_check)
+
+    p = sub.add_parser("product-zte-display-check")
+    p.add_argument("--state", default=None, help="override the state directory")
+    p.add_argument("--user-service-id", default=None, help="override the selected user service id")
+    p.add_argument("--vm-id", default=None, help="override the target desktop vmId")
+    p.add_argument("--dial-timeout", type=float, default=30.0, help="CAG TCP/TLS dial timeout seconds")
+    p.set_defaults(func=cmd_product_zte_display_check)
 
     p = sub.add_parser("state")
     p.set_defaults(func=cmd_state)
