@@ -280,7 +280,7 @@ class _FakeLink:
 
     def recv(self, n):
         if not self._in:
-            raise socket.timeout
+            return b""  # EOF -> _read_exact raises EOFError
         chunk = self._in[:n]
         del self._in[:n]
         return bytes(chunk)
@@ -355,12 +355,12 @@ class TestKeepZTESubchannelAlive:
     def test_replies_ping_then_stops_on_eof(self):
         from cmcc_cloud_alive.zte_raw_spice import rawMessageWithPrefix
         link = _FakeLink(6)
-        # one ping (type 0x05, empty payload) then EOF
-        link.feed(rawMessageWithPrefix(1, b"\x00\x05\x00\x00\x00\x00"))
+        # one ping (type 0x04, empty payload) then EOF
+        link.feed(rawMessageWithPrefix(1, b"\x04\x00\x00\x00\x00\x00"))
         lid = _route.keep_zte_subchannel_alive(link, link_id=6, read_timeout=0.5)
         assert lid == 6
-        # a pong (type 0x03) must have been written back
-        assert link.sent[8:10] == b"\x00\x03"
+        # a pong (type 0x03, little-endian) must have been written back
+        assert link.sent[8:10] == b"\x03\x00"
 
 
 if __name__ == "__main__":
