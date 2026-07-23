@@ -206,20 +206,40 @@ def state_path(args=None):
     return Path(os.environ.get("CMCC_ALIVE_STATE", DEFAULT_STATE))
 
 
+def _state_lock(path, mode="r"):
+    """Return a locked file object for atomic state.json access."""
+    import fcntl
+    f = path.open(mode, encoding="utf-8")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
 def load_state(args=None):
+    import fcntl
     path = state_path(args)
     if not path.exists():
         return {}
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    f = _state_lock(path, "r+")
+    try:
+        data = json.load(f)
+    except json.JSONDecodeError:
+        data = {}
+    fcntl.flock(f, fcntl.LOCK_UN)
+    f.close()
+    return data
 
 
 def save_state(state, args=None):
+    import fcntl
     path = state_path(args)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
+    f = _state_lock(path, "w+")
+    try:
         json.dump(state, f, ensure_ascii=False, indent=2)
         f.write("\n")
+    finally:
+        fcntl.flock(f, fcntl.LOCK_UN)
+        f.close()
     try:
         path.chmod(0o600)
     except OSError:
@@ -767,7 +787,7 @@ def api_request(url_path, data=None, args=None, timeout=30, state_override=None)
         if not state.get("publicKey"):
             if state_override is not None:
                 raise CmccError("missing publicKey in explicit state override")
-            ensure_public_key(args)
+            ensure_public_key(args, state=None)
             state = load_state(args)
         body = rsa_encrypt_body(data, state["publicKey"])
 
@@ -829,8 +849,11 @@ def assert_ok(response, label):
     raise CmccError(f"{label} failed: code={response.get('code')} msg={response.get('msg')}", response=response)
 
 
-def ensure_public_key(args=None):
-    state = load_state(args)
+def ensure_public_key(args=None, state=None):
+    """Ensure publicKey is available.
+    If state is provided, use it directly; otherwise load from args."""
+    if state is None:
+        state = load_state(args)
     if state.get("publicKey"):
         return state["publicKey"]
     response = api_request("/login/encryptKey/v1", None, args)
@@ -907,11 +930,16 @@ def protocol_check(args):
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
-def list_clouds(args):
-    response = api_request("/cc/cloudPc/list/v6", {"pageNum": 1}, args)
+def list_clouds(args=None, state_override=None):
+    response = api_request("/cc/cloudPc/list/v6", {"pageNum": 1}, args,
+                           state_override=state_override)
     assert_ok(response, "listClouds")
     items = (response.get("data") or {}).get("list") or []
-    merge_state({"cloudList": items, "lastCloudListAt": shanghai_now().isoformat()}, args)
+    if state_override is None:
+        merge_state({"cloudList": items, "lastCloudListAt": shanghai_now().isoformat()}, args)
+    else:
+        state_override["cloudList"] = items
+        state_override["lastCloudListAt"] = shanghai_now().isoformat()
     return items
 
 

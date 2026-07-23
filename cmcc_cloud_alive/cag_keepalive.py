@@ -188,17 +188,25 @@ def once(user_service_id=None, state_path=None, boot_wait=180, timeout=30, obser
 
 
 def run_loop(user_service_id=None, state_path=None, interval=60, run_seconds=0, account_relogin_hours=24, boot_wait=180, timeout=30, post_http_prime=False):
-    raise core.CmccError(
-        "cag-keepalive loop is disabled: CAG HTTPS is retained only for "
-        "boot/connect-material research and is rejected as desktop keepalive."
-    )
+    """CAG HTTPS keepalive loop.
+    Re-enabled: for unattended VMs (no official client), CAG sessions maintain
+    the desktop as active and prevent platform auto-shutdown.
+    Skips if uSmartView_VDI_Client is running locally (would replace the session)."""
     target = cloud.selected_user_service_id(state_path, user_service_id)
     started = time.time()
     last_account_refresh = 0
     count = 0
+    # Pre-check: skip if official desktop client is running locally
+    before = official_session_snapshot("pre-loop")
+    if before["desktopSessionPresent"]:
+        print("[CAG keepalive] uSmartView_VDI_Client is running locally — skipping "
+              "(CAG session would replace the active client session)", flush=True)
+        return
     while True:
         token.ensure_token(state_path, relogin=True)
         now = time.time()
+        if run_seconds and now - started >= run_seconds:
+            break
         if account_relogin_hours and now - last_account_refresh >= account_relogin_hours * 3600:
             try:
                 from . import auth
@@ -208,25 +216,22 @@ def run_loop(user_service_id=None, state_path=None, interval=60, run_seconds=0, 
             last_account_refresh = now
         count += 1
         result = once(target, state_path, boot_wait=boot_wait, timeout=timeout, post_http_prime=post_http_prime)
-        elapsed = int(time.time() - started)
-        status_text = "保活成功" if result["accepted"] else "保活失败"
-        proto = result["protocol"]
-        print(
-            f"[{core.short_time()}] [{count}] {status_text}: {core.format_duration(elapsed)} "
-            f"cagBusiness={proto['businessOk']} connectStr={proto['connectStr']} "
-            f"vmStatus={result['status']['vmStatusShow']}",
-            flush=True,
-        )
-        if not result["accepted"]:
-            raise core.CmccError(
-                f"CAG HTTPS keepalive failed; status={result['status'].get('vmStatusShow')} "
-                f"businessOk={proto['businessOk']} connectStr={proto['connectStr']}",
-                response=result,
-            )
-        if run_seconds and time.time() - started >= run_seconds:
-            return result
-        time.sleep(max(1, int(interval)))
-
+        protocol_ok = result.get("protocolAccepted", False)
+        running = result.get("status", {}).get("running", False)
+        takeover = result.get("sessionTakeoverObserved", False)
+        print(f"[CAG keepalive] #{count} protocolOk={protocol_ok} running={running} "
+              f"takeover={takeover} at={result.get('at', '?')}", flush=True)
+        if takeover:
+            print("[CAG keepalive] WARNING: official session was replaced — stopping", flush=True)
+            break
+        if run_seconds:
+            remaining = run_seconds - (now - started)
+            if remaining <= 0:
+                break
+            sleep_time = min(interval, remaining)
+        else:
+            sleep_time = interval
+        time.sleep(sleep_time)
 
 def run_verify(
     user_service_id=None,
